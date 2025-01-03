@@ -1,0 +1,346 @@
+创建一个自定义的Gym环境，用于SAC代理与目标检测模型的交互。
+# rl_environment.py
+import gym
+from gym import spaces
+import numpy as np
+import torch
+
+class FusionWeightEnv(gym.Env):
+    """
+    自定义强化学习环境，用于动态调整声呐和光学图像的权重。
+    """
+
+    def __init__(self, detection_model, data_loader, device):
+        super(FusionWeightEnv, self).__init__()
+        self.detection_model = detection_model
+        self.data_loader = data_loader
+        self.device = device
+
+        # 动作空间：调整声呐权重，光学权重为1 - action
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32)
+
+        # 状态空间：当前样本的特征统计信息（均值和标准差）
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(20,), dtype=np.float32)
+
+        self.current_sample = None
+        self.current_labels = None
+        self.iterator = iter(self.data_loader)
+
+    def reset(self):
+        # 重置环境，获取新的样本
+        try:
+            self.current_sample, self.current_labels = next(self.iterator)
+        except StopIteration:
+            self.iterator = iter(self.data_loader)
+            self.current_sample, self.current_labels = next(self.iterator)
+
+        # 初始化权重为0.5
+        self.current_weight = 0.5
+
+        # 获取初始状态
+        state = self.get_state()
+        return state
+
+    def step(self, action):
+        """
+        执行动作：调整权重
+        action: float, 声呐图像的权重比例，光学图像权重为1 - action
+        """
+        weight_sonar = np.clip(action[0], 0.0, 1.0)
+        weight_optical = 1.0 - weight_sonar
+
+        # 融合特征
+        optical = self.current_sample['optical'].to(self.device)
+        sonar = self.current_sample['sonar'].to(self.device)
+        fused_features = optical * weight_optical + sonar * weight_sonar
+
+        # 进行目标检测
+        with torch.no_grad():
+            detections = self.detection_model(fused_features.unsqueeze(0))
+
+        # 计算奖励，基于检测损失的降低
+        loss = self.compute_detection_loss(detections, self.current_labels.to(self.device))
+        reward = -loss.item()  # 奖励与损失成反比
+
+        # 获取下一状态
+        try:
+            self.current_sample, self.current_labels = next(self.iterator)
+        except StopIteration:
+            self.iterator = iter(self.data_loader)
+            self.current_sample, self.current_labels = next(self.iterator)
+
+        state = self.get_state()
+
+        done = False  # 持续的任务，没有终止条件
+
+        info = {}
+
+        return state, reward, done, info
+
+    def get_state(self):
+        """
+        提取当前状态的特征，这里采用当前样本融合特征的均值和标准差
+        """
+        optical = self.current_sample['optical'].cpu().numpy()
+        sonar = self.current_sample['sonar'].cpu().numpy()
+        fused = optical * self.current_weight + sonar * (1.0 - self.current_weight)
+
+        mean = np.mean(fused)
+        std = np.std(fused)
+
+        # 示例状态向量：均值和标准差以及其他统计信息
+        state = np.array([mean, std] + list(fused.flatten()[:18]))  # 总维度为20
+        return state.astype(np.float32)
+
+    def compute_detection_loss(self, detections, labels):
+        """
+        根据检测结果和标签计算损失，需要根据具体的检测模型和损失函数进行实现
+        """
+        # 示例实现，需根据实际情况调整
+        # 假设 detections 是模型的输出，需要转换为适当的格式
+        # 这里简化为返回一个随机损失
+        loss = torch.rand(1, device=self.device)
+        return loss
+使用stable-baselines3库中的SAC算法实现RL代理
+# rl_agent.py
+
+from stable_baselines3 import SAC
+from stable_baselines3.common.vec_env import DummyVecEnv
+from rl_environment import FusionWeightEnv
+
+
+def train_rl_agent(detection_model, data_loader, device, total_timesteps=100000):
+    # 初始化环境
+    env = FusionWeightEnv(detection_model, data_loader, device)
+    env = DummyVecEnv([lambda: env])  # 使用DummyVecEnv包装环境
+
+    # 定义SAC代理
+    model = SAC('MlpPolicy', env, verbose=1, tensorboard_log="./sac_fusion_tensorboard/")
+
+    # 训练代理
+    model.learn(total_timesteps=total_timesteps)
+
+    # 保存代理
+    model.save("sac_fusion_weight_agent")
+
+    return model
+修改交叉注意力融合模块，使其能够接收并应用RL代理生成的动态权重
+class CrossAttentionFusionSAC(nn.Module):
+    def __init__(self, in_channels_opt, in_channels_sonar, out_channels, rl_agent, device):
+        super(CrossAttentionFusionSAC, self).__init__()
+        # CBAM模块分别应用于光学和声呐特征
+        self.cbam_opt = CBAM(in_channels_opt)
+        self.cbam_sonar = CBAM(in_channels_sonar)
+
+        # 融合后的特征处理
+        self.conv_fuse = nn.Sequential(
+            nn.Conv2d(in_channels_opt + in_channels_sonar, out_channels * 2, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels * 2),
+            nn.SiLU()
+        )
+
+        # 最终融合卷积
+        self.final_conv = nn.Sequential(
+            nn.Conv2d(out_channels * 2, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU()
+        )
+
+        # RL代理和设备
+        self.rl_agent = rl_agent
+        self.device = device
+
+    def forward(self, optical_feat, sonar_feat):
+        # 分别通过CBAM
+        optical_feat = self.cbam_opt(optical_feat)
+        sonar_feat = self.cbam_sonar(sonar_feat)
+
+        # 融合特征
+        fused_feat = torch.cat([optical_feat, sonar_feat], dim=1)  # [B, C_opt + C_sonar, H, W]
+        fused_feat = self.conv_fuse(fused_feat)  # [B, 2 * C_out, H, W]
+
+        # 将融合特征传递给RL代理以获取权重
+        # 提取状态
+        state = self.extract_state(fused_feat)
+        state_tensor = torch.from_numpy(state).float().to(self.device)
+        state_tensor = state_tensor.unsqueeze(0)  # 添加batch维度
+
+        # 使用RL代理生成动作
+        with torch.no_grad():
+            action, _states = self.rl_agent.predict(state, deterministic=True)
+
+        # 获取权重
+        weight_sonar = np.clip(action[0], 0.0, 1.0)
+        weight_optical = 1.0 - weight_sonar
+
+        # 应用权重
+        feat_opt = optical_feat * weight_optical
+        feat_sonar = sonar_feat * weight_sonar
+
+        # 重新融合
+        fused_feat = torch.cat([feat_opt, feat_sonar], dim=1)  # [B, 2 * C_out, H, W]
+        fused_feat = self.final_conv(fused_feat)  # [B, C_out, H, W]
+
+        return fused_feat
+
+    def extract_state(self, fused_feat):
+        """
+        从融合特征中提取状态向量，需与环境定义的状态空间一致
+        """
+        B, C, H, W = fused_feat.size()
+        mean = fused_feat.mean(dim=[2, 3]).cpu().numpy()  # [B, C]
+        std = fused_feat.std(dim=[2, 3]).cpu().numpy()  # [B, C]
+        # 示例状态向量：均值和标准差
+        state = np.concatenate([mean, std], axis=1)  # [B, 2 * C]
+        return state
+集成SAC代理到YOLOv7模型中
+集成SAC代理到YOLOv7模型中
+
+class DualStreamBackboneSAC(nn.Module):
+    def __init__(self, depth, width, out_features=None, depthwise=False, act="silu", rl_agent=None, device='cuda'):
+        super(DualStreamBackboneSAC, self).__init__()
+        # 光学图像分支
+        self.optical_backbone = CSPDarknet(depth, width, out_features=["dark3", "dark4", "dark5"], depthwise=depthwise, act=act)
+        # 声呐图像分支
+        self.sonar_backbone = CSPDarknet(depth, width, out_features=["dark3", "dark4", "dark5"], depthwise=depthwise, act=act)
+
+        # 中间融合模块，使用CrossAttentionFusionSAC
+        self.fuse_dark3 = CrossAttentionFusionSAC(in_channels_opt=256 * width, in_channels_sonar=256 * width, out_channels=256 * width, rl_agent=rl_agent, device=device)
+        self.fuse_dark4 = CrossAttentionFusionSAC(in_channels_opt=512 * width, in_channels_sonar=512 * width, out_channels=512 * width, rl_agent=rl_agent, device=device)
+        self.fuse_dark5 = CrossAttentionFusionSAC(in_channels_opt=1024 * width, in_channels_sonar=1024 * width, out_channels=1024 * width, rl_agent=rl_agent, device=device)
+
+        if out_features is None:
+            self.out_features = ["dark3", "dark4", "dark5"]
+        else:
+            self.out_features = out_features
+
+    def forward(self, optical, sonar):
+        # 光学分支特征提取
+        opt_feats = self.optical_backbone(optical)  # {"dark3": ..., "dark4": ..., "dark5": ...}
+        # 声呐分支特征提取
+        sonar_feats = self.sonar_backbone(sonar)    # {"dark3": ..., "dark4": ..., "dark5": ...}
+
+        # 中间层级特征融合
+        fused_dark3 = self.fuse_dark3(opt_feats["dark3"], sonar_feats["dark3"])  # [B, 256*width, H, W]
+        fused_dark4 = self.fuse_dark4(opt_feats["dark4"], sonar_feats["dark4"])  # [B, 512*width, H, W]
+        fused_dark5 = self.fuse_dark5(opt_feats["dark5"], sonar_feats["dark5"])  # [B, 1024*width, H, W]
+
+        return {"dark3": fused_dark3, "dark4": fused_dark4, "dark5": fused_dark5}
+#集成SAC代理到YOLOv7模型中
+class MultiModalYOLOv7SAC(nn.Module):
+    def __init__(self, cfg, ch=6, nc=80, rl_agent=None, device='cuda'):
+        super(MultiModalYOLOv7SAC, self).__init__()
+        self.backbone = DualStreamBackboneSAC(cfg['backbone']['depth'], cfg['backbone']['width'],
+                                             out_features=cfg['backbone']['out_features'],
+                                             depthwise=cfg['backbone'].get('depthwise', False),
+                                             act=cfg['backbone'].get('act', "silu"),
+                                             rl_agent=rl_agent,
+                                             device=device)
+        self.neck = PANet(in_channels=[256 * cfg['backbone']['width'], 512 * cfg['backbone']['width'], 1024 * cfg['backbone']['width']],
+                          out_channels=256 * cfg['backbone']['width'],
+                          layers=cfg['neck']['layers'],
+                          activation=cfg['neck'].get('activation', "silu"))
+        self.head = YOLOHead(in_channels=256 * cfg['backbone']['width'],
+                             num_classes=nc,
+                             anchors=cfg['head']['anchors'])  # 假设YOLOHead已定义
+
+    def forward(self, optical, sonar):
+        # 获取融合后的多层特征
+        feats = self.backbone(optical, sonar)  # {"dark3": ..., "dark4": ..., "dark5": ...}
+
+        # 通过Neck
+        neck_out = self.neck([feats["dark3"], feats["dark4"], feats["dark5"]])
+
+        # 通过Head
+        output = self.head(neck_out)
+        return output
+联合训练
+# train_multimodal_sac.py
+import argparse
+import torch
+from models.yolov7 import MultiModalYOLOv7SAC
+from utils.datasets import MultiModalDataset
+from utils.augmentations import get_transforms
+from torch.utils.data import DataLoader
+from utils.general import compute_detection_loss  # 自定义损失函数
+import yaml
+import os
+from rl_agent import train_rl_agent
+
+def main(opt):
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # 加载配置文件
+    with open(opt.cfg) as f:
+        cfg = yaml.safe_load(f)
+
+    # 初始化数据集和数据加载器
+    train_dataset = MultiModalDataset(
+        sonar_img_dir=os.path.join(opt.data_dir, 'train/sonar'),
+        optical_img_dir=os.path.join(opt.data_dir, 'train/optical'),
+        label_dir=os.path.join(opt.data_dir, 'train/labels'),
+        img_size=opt.img_size,
+        augment=opt.augment,
+        transforms=get_transforms(img_size=opt.img_size, augment=opt.augment)
+    )
+    train_loader = DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers)
+
+    # 初始化YOLOv7模型（不含RL代理）
+    temp_model = MultiModalYOLOv7SAC(cfg, ch=6, nc=cfg['head']['num_classes'], rl_agent=None, device=device)
+    temp_model.to(device)
+
+    # 训练RL代理
+    rl_agent = train_rl_agent(temp_model, train_loader, device, total_timesteps=100000)
+
+    # 初始化多模态YOLOv7SAC模型，集成RL代理
+    model = MultiModalYOLOv7SAC(cfg, ch=6, nc=cfg['head']['num_classes'], rl_agent=rl_agent, device=device)
+    if opt.weights:
+        model.load_state_dict(torch.load(opt.weights, map_location=device)['model'], strict=False)
+    model.to(device)
+
+    # 定义优化器和损失函数
+    optimizer = torch.optim.Adam(model.parameters(), lr=opt.lr)
+    criterion = compute_detection_loss  # 自定义损失函数
+
+    # 训练循环
+    for epoch in range(opt.epochs):
+        model.train()
+        for batch_idx, (optical_imgs, sonar_imgs, labels) in enumerate(train_loader):
+            optical_imgs = optical_imgs.to(device)
+            sonar_imgs = sonar_imgs.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(optical_imgs, sonar_imgs)
+            loss, _ = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            if batch_idx % opt.log_interval == 0:
+                print(f"Epoch [{epoch+1}/{opt.epochs}], Step [{batch_idx}/{len(train_loader)}], Loss: {loss.item():.4f}")
+
+        # 保存模型
+        torch.save({
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+        }, os.path.join(opt.save_dir, f"epoch_{epoch+1}.pt"))
+
+    # 保存RL代理
+    rl_agent.save("sac_fusion_weight_agent_final")
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, default='dataset', help='dataset directory')
+    parser.add_argument('--cfg', type=str, default='cfg/training/yolov7_multimodal_sac.yaml', help='model.yaml path')
+    parser.add_argument('--weights', type=str, default='', help='initial weights path')
+    parser.add_argument('--img_size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--batch_size', type=int, default=16, help='batch size')
+    parser.add_argument('--epochs', type=int, default=100, help='number of epochs')
+    parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
+    parser.add_argument('--augment', action='store_true', help='apply data augmentation')
+    parser.add_argument('--num_workers', type=int, default=4, help='number of data loading workers')
+    parser.add_argument('--log_interval', type=int, default=10, help='logging interval')
+    parser.add_argument('--save_dir', type=str, default='runs/train_multimodal_sac', help='directory to save models')
+    opt = parser.parse_args()
+    main(opt)
+

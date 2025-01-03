@@ -1,0 +1,16 @@
+安装运行说明
+1、创建新的环境
+2、前往pytorch官网安装pytorch与cuda
+3、通过requirement.txt安装环境
+4、通过run_code.txt内的运行训练代码
+
+#run_code.txt训练：
+#CBAM-SAC-YOLOV7模型
+python train.py --img 640 --batch 8 --epoch 200 --data data/fish.yaml --cfg cfg/deploy/yolov7.yaml --weights weights/yolov7.pt --device 0
+#CBAM-SAC-YOLOV7X模型，使用的是这个模型
+python train.py --img 640 --batch 8 --epoch 300 --data data/fish.yaml --cfg cfg/deploy/yolov7x.yaml --weights weights/yolov7x.pt --device 0
+#预测(weight参数后面是训练好的模型的路径，Samples里是样例图片数据，没有参与过训练的图片)：
+水下生物
+python detect.py --weights 7x_model_freeze10/weights/best.pt --img-size 640 --source data/Samples
+水下目标
+python detect.py --weights 7x_model_freeze10/best.pt --img-size 640 --source data/valdata_test
